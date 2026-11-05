@@ -21,7 +21,7 @@ import (
 )
 
 var prPattern = regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)/pull/([1-9][0-9]*)/?$`)
-var failureText = regexp.MustCompile(`(?i)(failed to resume|resume failed|could not resume|unable to resume|error:)`)
+var resumeWarning = regexp.MustCompile(`(?im)^warning: message was queued, but could not resume thread\b`)
 var bots = map[string]bool{"greptile-apps[bot]": true, "greptile[bot]": true, "coderabbitai[bot]": true, "github-advanced-security[bot]": true}
 
 type registration struct{ URL, Thread string }
@@ -141,8 +141,8 @@ func queue(path string, r registration, lines []string) error {
 	if e != nil {
 		return fmt.Errorf("codex queue failed: %w", e)
 	}
-	if failureText.Match(out) {
-		return errors.New("codex reported a resume failure")
+	if resumeWarning.Match(out) {
+		log.Printf("%s: message queued, but Codex could not resume thread %s; check the chat if it does not resume", r.URL, r.Thread)
 	}
 	return nil
 }

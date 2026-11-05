@@ -34,7 +34,7 @@ func setup(t *testing.T) (*registration, string, string) {
  */check-runs*) if [ -f "$HOME/rerun" ]; then echo '[{"check_runs":[{"id":9,"name":"test","status":"completed","conclusion":"failure","completed_at":"2026-01-02"}]}]'; else echo '[{"check_runs":[{"id":6,"name":"test","status":"completed","conclusion":"failure","completed_at":"2026-01-01"}]}]'; fi ;;
  */statuses*) echo '[[{"id":8,"context":"deploy","state":"success"},{"id":7,"context":"deploy","state":"failure"}]]' ;;
  *) exit 1 ;; esac`)
-	codex := script(t, bin, "codex", `echo "$*" >> "$HOME/queued"; if [ -f "$HOME/fail" ]; then echo "failed to resume"; fi`)
+	codex := script(t, bin, "codex", `echo "$*" >> "$HOME/queued"; if [ -f "$HOME/queuefail" ]; then exit 1; fi; if [ -f "$HOME/fail" ]; then echo "Warning: message was queued, but could not resume thread thread-1: thread already has an active or pending turn" >&2; fi`)
 	return &registration{"https://github.com/acme/repo/pull/1", "thread-1"}, d, codex
 }
 func TestScanDurableAndRetry(t *testing.T) {
@@ -48,11 +48,18 @@ func TestScanDurableAndRetry(t *testing.T) {
 	if _, e = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); e != nil {
 		t.Fatal(e)
 	}
-	if e = os.WriteFile(filepath.Join(d, "fail"), nil, 0600); e != nil {
+	if e = os.WriteFile(filepath.Join(d, "queuefail"), nil, 0600); e != nil {
 		t.Fatal(e)
 	}
 	if e = scan(db, *r, c); e == nil {
-		t.Fatal("expected detected resume failure")
+		t.Fatal("expected failed queue command to remain retryable")
+	}
+	os.Remove(filepath.Join(d, "queuefail"))
+	if e = os.WriteFile(filepath.Join(d, "fail"), nil, 0600); e != nil {
+		t.Fatal(e)
+	}
+	if e = scan(db, *r, c); e != nil {
+		t.Fatalf("queued message with resume warning must be recorded: %v", e)
 	}
 	os.Remove(filepath.Join(d, "fail"))
 	if e = scan(db, *r, c); e != nil {
@@ -70,7 +77,7 @@ func TestScanDurableAndRetry(t *testing.T) {
 	b, _ := os.ReadFile(filepath.Join(d, "queued"))
 	s := string(b)
 	if strings.Count(s, "PR monitor:") != 2 {
-		t.Fatalf("expected one retry and no duplicate: %s", s)
+		t.Fatalf("expected retry only after failed queue command: %s", s)
 	}
 	for _, want := range []string{"review 1", "Bot feedback", "check"} {
 		if !strings.Contains(s, want) {
