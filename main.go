@@ -44,8 +44,10 @@ type apiReview struct {
 	Body        string  `json:"body"`
 }
 type pull struct {
-	State string `json:"state"`
-	Head  struct {
+	State    string `json:"state"`
+	ClosedAt string `json:"closed_at"`
+	MergedAt string `json:"merged_at"`
+	Head     struct {
 		SHA string `json:"sha"`
 	} `json:"head"`
 }
@@ -134,8 +136,7 @@ func already(db *sql.DB, u, k string) bool {
 	_ = db.QueryRow("SELECT count(*) FROM seen WHERE url=? AND event=?", u, k).Scan(&n)
 	return n > 0
 }
-func queue(path string, r registration, lines []string) error {
-	msg := "PR monitor: material changes for " + r.URL + "\n" + strings.Join(lines, "\n") + "\nInspect the full review and current head. Bob and agents share a login: exclude your own output using your checkpoint, and assess uncertain authorship before acting. Follow your existing review and CI contract."
+func queue(path string, r registration, msg string) error {
 	cmd := exec.Command(path, "queue", "--thread", r.Thread, "--message", msg, "--resume")
 	out, e := cmd.CombinedOutput()
 	if e != nil {
@@ -161,8 +162,23 @@ func scan(db *sql.DB, r registration, path string) error {
 		return errors.New("unexpected pull response")
 	}
 	p := pulls[0]
+	if p.State == "closed" {
+		state, at := "closed", p.ClosedAt
+		if p.MergedAt != "" {
+			state, at = "merged", p.MergedAt
+		}
+		if at == "" {
+			return errors.New("closed PR is missing its closure timestamp")
+		}
+		key := "terminal:" + state + ":" + at
+		if already(db, r.URL, key) {
+			return nil
+		}
+		msg := fmt.Sprintf("PR monitor: %s was %s at %s. Verify its current state, follow your existing PR contract, and remove the registration when ownership ends.", r.URL, state, at)
+		return deliver(db, r, path, []string{key}, msg)
+	}
 	if p.State != "open" {
-		return nil
+		return fmt.Errorf("unexpected PR state %q", p.State)
 	}
 	head := url.PathEscape(p.Head.SHA)
 	var reviews [][]apiReview
@@ -233,10 +249,17 @@ func scan(db *sql.DB, r registration, path string) error {
 			}
 		}
 	}
-	if len(keys) == 0 || !active(db, r) {
+	if len(keys) == 0 {
 		return nil
 	}
-	if e = queue(path, r, lines); e != nil {
+	msg := "PR monitor: material changes for " + r.URL + "\n" + strings.Join(lines, "\n") + "\nInspect the full review and current head. Bob and agents share a login: exclude your own output using your checkpoint, and assess uncertain authorship before acting. Follow your existing review and CI contract."
+	return deliver(db, r, path, keys, msg)
+}
+func deliver(db *sql.DB, r registration, path string, keys []string, msg string) error {
+	if !active(db, r) {
+		return nil
+	}
+	if e := queue(path, r, msg); e != nil {
 		return e
 	}
 	if !active(db, r) {

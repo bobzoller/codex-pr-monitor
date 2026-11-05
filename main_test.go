@@ -29,7 +29,7 @@ func setup(t *testing.T) (*registration, string, string) {
 	}
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	script(t, bin, "gh", `echo "$GH_TOKEN" > "$HOME/auth"; if [ -f "$HOME/ghfail" ]; then exit 1; fi; case "$4" in
- */pulls/1) echo '[{"state":"open","head":{"sha":"abc"}}]' ;;
+ */pulls/1) if [ -f "$HOME/pull.json" ]; then cat "$HOME/pull.json"; else echo '[{"state":"open","head":{"sha":"abc"}}]'; fi ;;
  */reviews*) echo '[[{"id":1,"user":{"login":"bobzoller","type":"User"},"state":"COMMENTED","submitted_at":"2026-01-01","body":""},{"id":2,"user":{"login":"bobzoller","type":"User"},"state":"PENDING","submitted_at":null,"body":"draft"},{"id":3,"user":{"login":"other","type":"User"},"state":"CHANGES_REQUESTED","submitted_at":"2026-01-01","body":"x"}]]' ;;
  */issues/1/comments*) echo '[[{"id":4,"user":{"login":"greptile-apps[bot]","type":"Bot"},"body":"finding","updated_at":"2026-01-01","html_url":"https://example/4"},{"id":5,"user":{"login":"bobzoller","type":"User"},"body":"agent reply","updated_at":"2026-01-01"}]]' ;;
  */pulls/1/comments*) echo '[[]]' ;;
@@ -133,7 +133,7 @@ func TestQueueResumeWarningIsReportedWithoutRequeue(t *testing.T) {
 	previous := log.Writer()
 	log.SetOutput(&logs)
 	defer log.SetOutput(previous)
-	if err := queue(codex, *r, []string{"feedback"}); err != nil {
+	if err := queue(codex, *r, "feedback"); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(logs.String(), "message queued, but Codex could not resume") {
@@ -141,6 +141,69 @@ func TestQueueResumeWarningIsReportedWithoutRequeue(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), r.Thread) {
 		t.Fatal("warning did not identify owning thread")
+	}
+}
+
+func TestTerminalStateNotification(t *testing.T) {
+	r, d, codex := setup(t)
+	db, err := dbOpen(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
+		t.Fatal(err)
+	}
+	setPull := func(data string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(d, "pull.json"), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setPull(`[{"state":"closed","closed_at":"2026-01-01T10:00:00Z","merged_at":null}]`)
+	if err = os.WriteFile(filepath.Join(d, "queuefail"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = scan(db, *r, codex); err == nil {
+		t.Fatal("queue failure should be retried")
+	}
+	os.Remove(filepath.Join(d, "queuefail"))
+	if err = scan(db, *r, codex); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = dbOpen(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = scan(db, *r, codex); err != nil {
+		t.Fatal(err)
+	}
+	setPull(`[{"state":"closed","closed_at":"2026-01-02T10:00:00Z","merged_at":null}]`)
+	if err = scan(db, *r, codex); err != nil {
+		t.Fatal(err)
+	}
+	setPull(`[{"state":"closed","closed_at":"2026-01-03T10:00:00Z","merged_at":"2026-01-03T10:00:00Z"}]`)
+	if err = scan(db, *r, codex); err != nil {
+		t.Fatal(err)
+	}
+	if err = scan(db, *r, codex); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(d, "queued"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(b)
+	if strings.Count(out, "was closed at") != 3 || strings.Count(out, "was merged at") != 1 {
+		t.Fatalf("unexpected terminal notifications: %s", out)
+	}
+	if strings.Contains(out, "Inspect the full review") {
+		t.Fatal("terminal message should not request a review assessment")
+	}
+	setPull(`[{"state":"closed","closed_at":null,"merged_at":null}]`)
+	if err = scan(db, *r, codex); err == nil {
+		t.Fatal("missing closure timestamp must be retried")
 	}
 }
 
