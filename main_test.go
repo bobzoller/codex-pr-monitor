@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,6 +124,26 @@ func TestScanDurableAndRetry(t *testing.T) {
 		t.Fatal("removed PR active")
 	}
 }
+func TestQueueResumeWarningIsReportedWithoutRequeue(t *testing.T) {
+	r, d, codex := setup(t)
+	if err := os.WriteFile(filepath.Join(d, "fail"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previous)
+	if err := queue(codex, *r, []string{"feedback"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "message queued, but Codex could not resume") {
+		t.Fatalf("warning not logged: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), r.Thread) {
+		t.Fatal("warning did not identify owning thread")
+	}
+}
+
 func TestWorkingHours(t *testing.T) {
 	loc := time.FixedZone("local", -10*3600)
 	for _, tc := range []struct {
