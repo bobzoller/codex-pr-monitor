@@ -172,10 +172,36 @@ func scan(db *sql.DB, r registration, path string) error {
 		}
 		key := "terminal:" + state + ":" + at
 		if already(db, r.URL, key) {
+			// Clean up registrations notified by earlier versions without sending again.
+			_, e := db.Exec("DELETE FROM prs WHERE url=? AND thread=?", r.URL, r.Thread)
+			return e
+		}
+		if !active(db, r) {
 			return nil
 		}
-		msg := fmt.Sprintf("PR monitor: %s was %s at %s. Verify its current state, follow your existing PR contract, and remove the registration when ownership ends.", r.URL, state, at)
-		return deliver(db, r, path, []string{key}, msg)
+		msg := fmt.Sprintf("PR monitor: %s was %s at %s. This monitor is being removed; re-register the PR if it is reopened. Verify its current state and follow your existing PR contract.", r.URL, state, at)
+		if e := queue(path, r, msg); e != nil {
+			return e
+		}
+		tx, e := db.Begin()
+		if e != nil {
+			return e
+		}
+		defer tx.Rollback()
+		result, e := tx.Exec("DELETE FROM prs WHERE url=? AND thread=?", r.URL, r.Thread)
+		if e != nil {
+			return e
+		}
+		n, e := result.RowsAffected()
+		if e != nil {
+			return e
+		}
+		if n > 0 {
+			if _, e = tx.Exec("INSERT OR IGNORE INTO seen(url,event) VALUES(?,?)", r.URL, key); e != nil {
+				return e
+			}
+		}
+		return tx.Commit()
 	}
 	if p.State != "open" {
 		return fmt.Errorf("unexpected PR state %q", p.State)

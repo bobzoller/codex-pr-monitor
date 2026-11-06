@@ -150,8 +150,12 @@ func TestTerminalStateNotification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
-		t.Fatal(err)
+	defer func() { db.Close() }()
+	register := func() {
+		t.Helper()
+		if _, err := db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
+			t.Fatal(err)
+		}
 	}
 	setPull := func(data string) {
 		t.Helper()
@@ -159,51 +163,74 @@ func TestTerminalStateNotification(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	register()
 	setPull(`[{"state":"closed","closed_at":"2026-01-01T10:00:00Z","merged_at":null}]`)
 	if err = os.WriteFile(filepath.Join(d, "queuefail"), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err = scan(db, *r, codex); err == nil {
-		t.Fatal("queue failure should be retried")
+	if err = scan(db, *r, codex); err == nil || !active(db, *r) {
+		t.Fatal("failed queue must retain registration for retry")
 	}
 	os.Remove(filepath.Join(d, "queuefail"))
-	if err = scan(db, *r, codex); err != nil {
+	if err = os.WriteFile(filepath.Join(d, "fail"), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err = scan(db, *r, codex); err != nil || active(db, *r) {
+		t.Fatalf("queued warning should remove registration: %v", err)
+	}
+	os.Remove(filepath.Join(d, "fail"))
 	db.Close()
 	db, err = dbOpen(d)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	if err = scan(db, *r, codex); err != nil {
-		t.Fatal(err)
+	register() // Previously notified terminal registrations are silently cleaned up.
+	if err = scan(db, *r, codex); err != nil || active(db, *r) {
+		t.Fatalf("already notified registration not removed: %v", err)
 	}
-	setPull(`[{"state":"closed","closed_at":"2026-01-02T10:00:00Z","merged_at":null}]`)
-	if err = scan(db, *r, codex); err != nil {
-		t.Fatal(err)
-	}
+	register()
 	setPull(`[{"state":"closed","closed_at":"2026-01-03T10:00:00Z","merged_at":"2026-01-03T10:00:00Z"}]`)
-	if err = scan(db, *r, codex); err != nil {
-		t.Fatal(err)
-	}
-	if err = scan(db, *r, codex); err != nil {
-		t.Fatal(err)
+	if err = scan(db, *r, codex); err != nil || active(db, *r) {
+		t.Fatalf("merged registration not removed: %v", err)
 	}
 	b, err := os.ReadFile(filepath.Join(d, "queued"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	out := string(b)
-	if strings.Count(out, "was closed at") != 3 || strings.Count(out, "was merged at") != 1 {
+	if strings.Count(out, "was closed at") != 2 || strings.Count(out, "was merged at") != 1 || !strings.Contains(out, "monitor is being removed") {
 		t.Fatalf("unexpected terminal notifications: %s", out)
 	}
-	if strings.Contains(out, "Inspect the full review") {
-		t.Fatal("terminal message should not request a review assessment")
-	}
+	register()
 	setPull(`[{"state":"closed","closed_at":null,"merged_at":null}]`)
-	if err = scan(db, *r, codex); err == nil {
-		t.Fatal("missing closure timestamp must be retried")
+	if err = scan(db, *r, codex); err == nil || !active(db, *r) {
+		t.Fatal("missing timestamp must retain registration")
+	}
+}
+
+func TestTerminalQueuePreservesNewOwner(t *testing.T) {
+	r, d, _ := setup(t)
+	db, err := dbOpen(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(d, "pull.json"), []byte(`[{"state":"closed","closed_at":"2026-01-01T10:00:00Z"}]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	codex := script(t, d, "switch-owner", `sqlite3 "$HOME/state.db" "UPDATE prs SET thread='new-owner'"`)
+	if err = scan(db, *r, codex); err != nil {
+		t.Fatal(err)
+	}
+	var owner string
+	if err = db.QueryRow("SELECT thread FROM prs WHERE url=?", r.URL).Scan(&owner); err != nil || owner != "new-owner" {
+		t.Fatalf("new owner lost: %q %v", owner, err)
+	}
+	if already(db, r.URL, "terminal:closed:2026-01-01T10:00:00Z") {
+		t.Fatal("new owner should still receive the notification")
 	}
 }
 
