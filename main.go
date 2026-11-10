@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -106,22 +107,30 @@ func codexPath() (string, error) {
 	return "", errors.New("codex not found on PATH or in ChatGPT.app; install Codex CLI")
 }
 func gh(endpoint string, dst any) error {
-	cmd := exec.Command("gh", "api", "--paginate", "--slurp", endpoint) // gh honors GH_TOKEN before GITHUB_TOKEN, so explicitly prefer the requested token.
-	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
-		env := os.Environ()
-		filtered := make([]string, 0, len(env)+1)
-		for _, v := range env {
-			if !strings.HasPrefix(v, "GH_TOKEN=") {
-				filtered = append(filtered, v)
-			}
-		}
-		cmd.Env = append(filtered, "GH_TOKEN="+t)
+	if !githubAvailable() {
+		return errors.New("GitHub rate limit backoff active")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "api", "--include", "--paginate", endpoint) // gh honors GH_TOKEN before GITHUB_TOKEN, so explicitly prefer the requested token.
+	cmd.Env = ghEnv()
 	out, e := cmd.Output()
+	var stderr string
+	if x, ok := e.(*exec.ExitError); ok {
+		stderr = string(x.Stderr)
+	}
+	header, body, status, parseErr := splitGHPages(out)
+	if parseErr != nil && e == nil {
+		return parseErr
+	}
+	if isRateLimited(header, status, stderr) {
+		noteRateLimit(header)
+		return errors.New("GitHub rate limited the monitor; backing off")
+	}
 	if e != nil {
 		return fmt.Errorf("gh api %s failed: %w", endpoint, e)
 	}
-	if e = json.Unmarshal(out, dst); e != nil {
+	if e = json.Unmarshal(body, dst); e != nil {
 		return fmt.Errorf("parse %s: %w", endpoint, e)
 	}
 	return nil
@@ -147,21 +156,33 @@ func queue(path string, r registration, msg string) error {
 	}
 	return nil
 }
-func scan(db *sql.DB, r registration, path string) error {
+func scan(db *sql.DB, r registration, path string) error { return scanSnapshot(db, r, path, nil) }
+func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot) error {
 	_, m, e := validURL(r.URL)
 	if e != nil {
 		return e
 	}
 	base := fmt.Sprintf("repos/%s/%s", m[1], m[2])
 	pr := base + "/pulls/" + m[3]
-	var pulls []pull
-	if e = gh(pr, &pulls); e != nil {
-		return e
+	var p pull
+	if snapshot != nil {
+		p.State = strings.ToLower(snapshot.State)
+		if p.State == "merged" {
+			p.State = "closed"
+		}
+		p.ClosedAt = snapshot.ClosedAt
+		p.MergedAt = snapshot.MergedAt
+		p.Head.SHA = snapshot.Head
+	} else {
+		var pulls []pull
+		if e = gh(pr, &pulls); e != nil {
+			return e
+		}
+		if len(pulls) != 1 {
+			return errors.New("unexpected pull response")
+		}
+		p = pulls[0]
 	}
-	if len(pulls) != 1 {
-		return errors.New("unexpected pull response")
-	}
-	p := pulls[0]
 	if p.State == "closed" {
 		state, at := "closed", p.ClosedAt
 		if p.MergedAt != "" {
@@ -213,13 +234,32 @@ func scan(db *sql.DB, r registration, path string) error {
 		CheckRuns []apiCheck `json:"check_runs"`
 	}
 	var statuses [][]status
-	for _, q := range []struct {
-		path string
-		dst  any
-	}{{pr + "/reviews?per_page=100", &reviews}, {base + "/issues/" + m[3] + "/comments?per_page=100", &issueComments}, {pr + "/comments?per_page=100", &reviewComments}, {base + "/commits/" + head + "/check-runs?per_page=100", &checks}, {base + "/commits/" + head + "/statuses?per_page=100", &statuses}} {
-		if e = gh(q.path, q.dst); e != nil {
+	var haveReviews, haveIssue, haveInline bool
+	if snapshot != nil {
+		reviews, haveReviews = snapshot.restReviews()
+		issueComments, haveIssue = snapshot.restComments(false)
+		reviewComments, haveInline = snapshot.restComments(true)
+	}
+	if !haveReviews {
+		if e = gh(pr+"/reviews?per_page=100", &reviews); e != nil {
 			return e
 		}
+	}
+	if !haveIssue {
+		if e = gh(base+"/issues/"+m[3]+"/comments?per_page=100", &issueComments); e != nil {
+			return e
+		}
+	}
+	if !haveInline {
+		if e = gh(pr+"/comments?per_page=100", &reviewComments); e != nil {
+			return e
+		}
+	}
+	if e = gh(base+"/commits/"+head+"/check-runs?per_page=100", &checks); e != nil {
+		return e
+	}
+	if e = gh(base+"/commits/"+head+"/statuses?per_page=100", &statuses); e != nil {
+		return e
 	}
 	var keys, lines []string
 	add := func(k, l string) {
@@ -303,7 +343,63 @@ func deliver(db *sql.DB, r registration, path string, keys []string, msg string)
 	}
 	return tx.Commit()
 }
+func pollBatch(db *sql.DB, path string, batch []registration) bool {
+	if len(batch) == 0 || !githubAvailable() {
+		return false
+	}
+	snapshots, err := ghGraphQL(batch)
+	if err != nil {
+		log.Printf("GitHub batch: %v", err)
+		if !githubAvailable() {
+			return false
+		}
+		if errors.Is(err, errGraphQLRejected) && len(batch) > 1 {
+			middle := len(batch) / 2
+			a := pollBatch(db, path, batch[:middle])
+			b := pollBatch(db, path, batch[middle:])
+			return a && b
+		}
+		if errors.Is(err, errGraphQLUnsupported) || errors.Is(err, errGraphQLRejected) {
+			ok := true
+			for _, r := range batch {
+				if active(db, r) {
+					if e := scan(db, r, path); e != nil {
+						ok = false
+						log.Printf("%s: %v", r.URL, e)
+					}
+				}
+				if !githubAvailable() {
+					return false
+				}
+			}
+			return ok
+		}
+		return false
+	}
+	ok := true
+	for i, r := range batch {
+		if !active(db, r) {
+			continue
+		}
+		if snapshots[i].err != nil {
+			ok = false
+			log.Printf("%s: %v", r.URL, snapshots[i].err)
+			continue
+		}
+		if e := scanSnapshot(db, r, path, snapshots[i].snap); e != nil {
+			ok = false
+			log.Printf("%s: %v", r.URL, e)
+		}
+		if !githubAvailable() {
+			return false
+		}
+	}
+	return ok
+}
 func poll(db *sql.DB, path string) {
+	if !githubAvailable() {
+		return
+	}
 	rows, e := db.Query("SELECT url,thread FROM prs ORDER BY url")
 	if e != nil {
 		log.Print(e)
@@ -312,17 +408,34 @@ func poll(db *sql.DB, path string) {
 	var rs []registration
 	for rows.Next() {
 		var r registration
-		if rows.Scan(&r.URL, &r.Thread) == nil {
-			rs = append(rs, r)
+		if e := rows.Scan(&r.URL, &r.Thread); e != nil {
+			log.Print(e)
+			rows.Close()
+			return
+		}
+		rs = append(rs, r)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		log.Print(e)
+		return
+	}
+	healthy := true
+	for start := 0; start < len(rs); start += batchSize {
+		end := start + batchSize
+		if end > len(rs) {
+			end = len(rs)
+		}
+		if !pollBatch(db, path, rs[start:end]) {
+			healthy = false
+		}
+		if !githubAvailable() {
+			return
 		}
 	}
-	rows.Close()
-	for _, r := range rs {
-		if active(db, r) {
-			if e := scan(db, r, path); e != nil {
-				log.Printf("%s: %v", r.URL, e)
-			}
-		}
+	if healthy {
+		rateFailures = 0
 	}
 }
 func working(t time.Time) bool {
@@ -345,7 +458,7 @@ func daemon(d, path string) error {
 	defer db.Close()
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
-	ticker := time.NewTicker(15 * time.Minute)
+	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	if working(time.Now()) {
 		poll(db, path)
