@@ -438,9 +438,6 @@ func poll(db *sql.DB, path string) {
 		rateFailures = 0
 	}
 }
-func working(t time.Time) bool {
-	return t.Weekday() != time.Saturday && t.Weekday() != time.Sunday && t.Hour() >= 8 && t.Hour() < 18
-}
 func daemon(d, path string) error {
 	f := os.NewFile(3, "lock")
 	if f == nil {
@@ -460,17 +457,13 @@ func daemon(d, path string) error {
 	signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	if working(time.Now()) {
-		poll(db, path)
-	}
+	poll(db, path)
 	for {
 		select {
 		case <-sig:
 			return nil
-		case t := <-ticker.C:
-			if working(t) {
-				poll(db, path)
-			}
+		case <-ticker.C:
+			poll(db, path)
 		}
 	}
 }

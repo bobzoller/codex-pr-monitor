@@ -234,18 +234,6 @@ func TestTerminalQueuePreservesNewOwner(t *testing.T) {
 	}
 }
 
-func TestWorkingHours(t *testing.T) {
-	loc := time.FixedZone("local", -10*3600)
-	for _, tc := range []struct {
-		date string
-		want bool
-	}{{"2026-11-06T08:00:00-10:00", true}, {"2026-11-06T18:00:00-10:00", false}, {"2026-11-07T09:00:00-10:00", false}} {
-		v, e := time.ParseInLocation(time.RFC3339, tc.date, loc)
-		if e != nil || working(v) != tc.want {
-			t.Fatal(tc)
-		}
-	}
-}
 func TestStartStop(t *testing.T) {
 	_, d, _ := setup(t)
 	exe := filepath.Join(d, "monitor")
