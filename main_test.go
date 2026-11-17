@@ -81,14 +81,19 @@ func TestScanDurableAndRetry(t *testing.T) {
 	if strings.Count(s, "PR monitor:") != 2 {
 		t.Fatalf("expected retry only after failed queue command: %s", s)
 	}
+	var inbox bytes.Buffer
+	if e = showInbox(db, r.URL, r.Thread, &inbox); e != nil {
+		t.Fatal(e)
+	}
+	details := inbox.String()
 	for _, want := range []string{"review 1", "Bot feedback", "check"} {
-		if !strings.Contains(s, want) {
-			t.Fatalf("missing %s: %s", want, s)
+		if !strings.Contains(details, want) {
+			t.Fatalf("missing %s: %s", want, details)
 		}
 	}
 	for _, bad := range []string{"review 2", "review 3", "agent reply", "deploy"} {
-		if strings.Contains(s, bad) {
-			t.Fatalf("unexpected %s: %s", bad, s)
+		if strings.Contains(details, bad) {
+			t.Fatalf("unexpected %s: %s", bad, details)
 		}
 	}
 	auth, _ := os.ReadFile(filepath.Join(d, "auth"))
@@ -110,8 +115,15 @@ func TestScanDurableAndRetry(t *testing.T) {
 		t.Fatal(e)
 	}
 	queued, _ := os.ReadFile(filepath.Join(d, "queued"))
-	if strings.Count(string(queued), "PR monitor:") != 3 || !strings.Contains(string(queued), "run 9") {
-		t.Fatal("rerun was not delivered after retry")
+	if strings.Count(string(queued), "PR monitor:") != 2 {
+		t.Fatal("new event should coalesce behind outstanding wake")
+	}
+	inbox.Reset()
+	if e = showInbox(db, r.URL, r.Thread, &inbox); e != nil {
+		t.Fatal(e)
+	}
+	if !strings.Contains(inbox.String(), "run 9") {
+		t.Fatal("rerun missing from inbox")
 	}
 	auth, _ = os.ReadFile(filepath.Join(d, "auth"))
 	if strings.TrimSpace(string(auth)) != "other" {
@@ -198,8 +210,15 @@ func TestTerminalStateNotification(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := string(b)
-	if strings.Count(out, "was closed at") != 2 || strings.Count(out, "was merged at") != 1 || !strings.Contains(out, "monitor is being removed") {
-		t.Fatalf("unexpected terminal notifications: %s", out)
+	if strings.Count(out, "PR monitor:") != 2 || !strings.Contains(out, "closed; monitoring removed") {
+		t.Fatalf("unexpected terminal wakes: %s", out)
+	}
+	var inbox bytes.Buffer
+	if err = showInbox(db, r.URL, r.Thread, &inbox); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(inbox.String(), "PR merged at") || !strings.Contains(inbox.String(), "Monitoring removed") {
+		t.Fatalf("missing merged event: %s", inbox.String())
 	}
 	register()
 	setPull(`[{"state":"closed","closed_at":null,"merged_at":null}]`)
@@ -229,8 +248,13 @@ func TestTerminalQueuePreservesNewOwner(t *testing.T) {
 	if err = db.QueryRow("SELECT thread FROM prs WHERE url=?", r.URL).Scan(&owner); err != nil || owner != "new-owner" {
 		t.Fatalf("new owner lost: %q %v", owner, err)
 	}
-	if already(db, r.URL, "terminal:closed:2026-01-01T10:00:00Z") {
-		t.Fatal("new owner should still receive the notification")
+	replacement := registration{URL: r.URL, Thread: "new-owner"}
+	if err = scan(db, replacement, codex); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err = db.QueryRow("SELECT count(*) FROM inbox_items WHERE url=? AND thread=?", r.URL, replacement.Thread).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("new owner missed event: %d %v", count, err)
 	}
 }
 

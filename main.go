@@ -82,7 +82,7 @@ func dbOpen(d string) (*sql.DB, error) {
 		return nil, e
 	}
 	db.SetMaxOpenConns(1)
-	_, e = db.Exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS prs(url TEXT PRIMARY KEY, thread TEXT NOT NULL); CREATE TABLE IF NOT EXISTS seen(url TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(url,event));`)
+	_, e = db.Exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS prs(url TEXT PRIMARY KEY, thread TEXT NOT NULL); CREATE TABLE IF NOT EXISTS seen(url TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(url,event)); CREATE TABLE IF NOT EXISTS inbox_items(id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, thread TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL, UNIQUE(url,thread,event)); CREATE TABLE IF NOT EXISTS inbox_wakes(id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, thread TEXT NOT NULL, attempts INTEGER NOT NULL, sent_at INTEGER NOT NULL, UNIQUE(url,thread));`)
 	if e != nil {
 		db.Close()
 		return nil, e
@@ -192,37 +192,27 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 			return errors.New("closed PR is missing its closure timestamp")
 		}
 		key := "terminal:" + state + ":" + at
-		if already(db, r.URL, key) {
-			// Clean up registrations notified by earlier versions without sending again.
-			_, e := db.Exec("DELETE FROM prs WHERE url=? AND thread=?", r.URL, r.Thread)
-			return e
-		}
-		if !active(db, r) {
-			return nil
-		}
-		msg := fmt.Sprintf("PR monitor: %s was %s at %s. This monitor is being removed; re-register the PR if it is reopened. Verify its current state and follow your existing PR contract.", r.URL, state, at)
-		if e := queue(path, r, msg); e != nil {
-			return e
-		}
-		tx, e := db.Begin()
-		if e != nil {
-			return e
-		}
-		defer tx.Rollback()
-		result, e := tx.Exec("DELETE FROM prs WHERE url=? AND thread=?", r.URL, r.Thread)
-		if e != nil {
-			return e
-		}
-		n, e := result.RowsAffected()
-		if e != nil {
-			return e
-		}
-		if n > 0 {
-			if _, e = tx.Exec("INSERT OR IGNORE INTO seen(url,event) VALUES(?,?)", r.URL, key); e != nil {
+		if !already(db, r.URL, key) || pendingForAnotherOwner(db, r, key) {
+			detail := fmt.Sprintf("PR %s at %s. Monitoring removed; register again if reopened.", state, at)
+			if e := saveEvents(db, r, []string{key}, []string{detail}); e != nil {
 				return e
 			}
 		}
-		return tx.Commit()
+		var pending int
+		if e := db.QueryRow("SELECT count(*) FROM inbox_items WHERE url=? AND thread=? AND event=?", r.URL, r.Thread, key).Scan(&pending); e != nil {
+			return e
+		}
+		if pending != 0 {
+			sent, e := sendWake(db, path, r)
+			if e != nil {
+				return e
+			}
+			if !sent {
+				return nil
+			}
+		}
+		_, e := db.Exec("DELETE FROM prs WHERE url=? AND thread=?", r.URL, r.Thread)
+		return e
 	}
 	if p.State != "open" {
 		return fmt.Errorf("unexpected PR state %q", p.State)
@@ -263,7 +253,7 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 	}
 	var keys, lines []string
 	add := func(k, l string) {
-		if !already(db, r.URL, k) {
+		if !already(db, r.URL, k) || pendingForAnotherOwner(db, r, k) {
 			keys = append(keys, k)
 			lines = append(lines, l)
 		}
@@ -279,10 +269,10 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 	for _, page := range reviews {
 		for _, v := range page {
 			if v.SubmittedAt != nil && v.User.Login == "bobzoller" && v.State != "PENDING" && (v.State != "APPROVED" || strings.TrimSpace(v.Body) != "" || inlineReviews[v.ID]) {
-				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Submitted review %d by bobzoller (authorship needs verification).", v.ID))
+				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Submitted review %d by bobzoller.", v.ID))
 			}
 			if v.SubmittedAt != nil && bots[strings.ToLower(v.User.Login)] && v.User.Type == "Bot" && (v.State != "APPROVED" || strings.TrimSpace(v.Body) != "" || inlineReviews[v.ID]) {
-				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Bot review %d by %s: assess its findings.", v.ID, v.User.Login))
+				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Bot review %d by %s.", v.ID, v.User.Login))
 			}
 		}
 	}
@@ -290,7 +280,7 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 		for _, page := range pages {
 			for _, v := range page {
 				if bots[strings.ToLower(v.User.Login)] && v.User.Type == "Bot" && strings.TrimSpace(v.Body) != "" {
-					add(fmt.Sprintf("comment:%d:%s", v.ID, v.UpdatedAt), fmt.Sprintf("Bot feedback %s by %s: assess its findings.", v.HTMLURL, v.User.Login))
+					add(fmt.Sprintf("comment:%d:%s", v.ID, v.UpdatedAt), fmt.Sprintf("Bot feedback %s by %s.", v.HTMLURL, v.User.Login))
 				}
 			}
 		}
@@ -316,33 +306,16 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 		}
 	}
 	if len(keys) == 0 {
-		return nil
-	}
-	msg := "PR monitor: material changes for " + r.URL + "\n" + strings.Join(lines, "\n") + "\nInspect the full review and current head. Bob and agents share a login: exclude your own output using your checkpoint, and assess uncertain authorship before acting. Follow your existing review and CI contract."
-	return deliver(db, r, path, keys, msg)
-}
-func deliver(db *sql.DB, r registration, path string, keys []string, msg string) error {
-	if !active(db, r) {
-		return nil
-	}
-	if e := queue(path, r, msg); e != nil {
+		_, e = sendWake(db, path, r)
 		return e
 	}
-	if !active(db, r) {
-		return nil
-	}
-	tx, e := db.Begin()
-	if e != nil {
+	if e = saveEvents(db, r, keys, lines); e != nil {
 		return e
 	}
-	defer tx.Rollback()
-	for _, k := range keys {
-		if _, e = tx.Exec("INSERT OR IGNORE INTO seen(url,event) VALUES(?,?)", r.URL, k); e != nil {
-			return e
-		}
-	}
-	return tx.Commit()
+	_, e = sendWake(db, path, r)
+	return e
 }
+
 func pollBatch(db *sql.DB, path string, batch []registration) bool {
 	if len(batch) == 0 || !githubAvailable() {
 		return false
@@ -397,6 +370,7 @@ func pollBatch(db *sql.DB, path string, batch []registration) bool {
 	return ok
 }
 func poll(db *sql.DB, path string) {
+	flushInbox(db, path)
 	if !githubAvailable() {
 		return
 	}
@@ -533,7 +507,7 @@ func stop(d string) error {
 }
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: codex-pr-monitor start|stop|add|remove")
+		return errors.New("usage: codex-pr-monitor start|stop|add|remove|inbox|ack")
 	}
 	d, e := configDir()
 	if e != nil {
@@ -549,10 +523,12 @@ func run(args []string) error {
 			return errors.New("missing codex path")
 		}
 		return daemon(d, args[1])
-	case "add", "remove":
+	case "add", "remove", "inbox", "ack":
 		fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		u := fs.String("url", "", "PR URL")
 		t := fs.String("thread", "", "owning thread ID")
+		wake := fs.Int64("wake", -1, "wake ID from inbox")
+		through := fs.Int64("through", 0, "last handled inbox item")
 		if e = fs.Parse(args[1:]); e != nil {
 			return e
 		}
@@ -570,12 +546,26 @@ func run(args []string) error {
 				return errors.New("--thread is required")
 			}
 			_, e = db.Exec("INSERT INTO prs(url,thread) VALUES(?,?) ON CONFLICT(url) DO UPDATE SET thread=excluded.thread", normalized, *t)
+		} else if args[0] == "remove" {
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			for _, q := range []string{"DELETE FROM prs WHERE url=?", "DELETE FROM inbox_items WHERE url=?", "DELETE FROM inbox_wakes WHERE url=?"} {
+				if _, err = tx.Exec(q, normalized); err != nil {
+					return err
+				}
+			}
+			e = tx.Commit()
+		} else if args[0] == "inbox" {
+			e = showInbox(db, normalized, *t, os.Stdout)
 		} else {
-			_, e = db.Exec("DELETE FROM prs WHERE url=?", normalized)
+			e = ackInbox(db, normalized, *t, *wake, *through)
 		}
 		return e
 	default:
-		return errors.New("usage: codex-pr-monitor start|stop|add|remove")
+		return errors.New("usage: codex-pr-monitor start|stop|add|remove|inbox|ack")
 	}
 }
 func main() {

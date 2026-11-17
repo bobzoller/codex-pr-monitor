@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -49,7 +50,7 @@ func TestGraphQLBatchAndDurableLegacyIDs(t *testing.T) {
 		t.Fatal(e)
 	}
 	out := string(b)
-	if strings.Count(out, "PR monitor:") != 1 || !strings.Contains(out, "was merged") || strings.Contains(out, "thread-1") || strings.Contains(out, "draft") {
+	if strings.Count(out, "PR monitor:") != 1 || !strings.Contains(out, "merged; monitoring removed") || strings.Contains(out, "thread-1") || strings.Contains(out, "draft") {
 		t.Fatalf("unexpected deliveries %s", out)
 	}
 	calls, _ := os.ReadFile(filepath.Join(d, "requests"))
@@ -110,9 +111,12 @@ func TestGraphQLPaginationFallsBackToREST(t *testing.T) {
 			t.Fatalf("missing fallback %s: %s", want, out)
 		}
 	}
-	q, _ := os.ReadFile(filepath.Join(d, "queued"))
-	if !strings.Contains(string(q), "review 1") || !strings.Contains(string(q), "Bot feedback") {
-		t.Fatalf("missing feedback %s", q)
+	var q bytes.Buffer
+	if e = showInbox(db, r.URL, r.Thread, &q); e != nil {
+		t.Fatal(e)
+	}
+	if !strings.Contains(q.String(), "review 1") || !strings.Contains(q.String(), "Bot feedback") {
+		t.Fatalf("missing feedback %s", q.String())
 	}
 }
 func TestSplitGHPages(t *testing.T) {
@@ -164,9 +168,9 @@ func TestGraphQLSchemaFallbackAndUnchangedQueue(t *testing.T) {
 		t.Fatal(e)
 	}
 	poll(db, c)
-	b, e := os.ReadFile(filepath.Join(d, "queued"))
-	if e != nil || !strings.Contains(string(b), "review 1") {
-		t.Fatalf("REST schema fallback failed: %s %v", b, e)
+	var b bytes.Buffer
+	if e = showInbox(db, r.URL, r.Thread, &b); e != nil || !strings.Contains(b.String(), "review 1") {
+		t.Fatalf("REST schema fallback failed: %s %v", b.String(), e)
 	}
 }
 func TestGraphQLCommentTextCannotTriggerRateLimit(t *testing.T) {
@@ -242,7 +246,7 @@ func TestRejectedGraphQLBatchSplitsAndContinues(t *testing.T) {
 		t.Fatalf("expected 1 batch and 2 smaller queries: %s", b)
 	}
 	q, _ := os.ReadFile(filepath.Join(d, "queued"))
-	if strings.Count(string(q), "was merged") != 2 {
+	if strings.Count(string(q), "merged; monitoring removed") != 2 {
 		t.Fatalf("missing terminal notification: %s", q)
 	}
 }
