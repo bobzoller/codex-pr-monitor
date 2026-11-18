@@ -40,7 +40,7 @@ func TestGraphQLBatchAndDurableLegacyIDs(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s},"p1":{"pullRequest":%s}}}`, openGraph, closedGraph))
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"bobzoller"},"p0":{"pullRequest":%s},"p1":{"pullRequest":%s}}}`, openGraph, closedGraph))
 	poll(db, c)
 	if !active(db, *r) || active(db, r2) {
 		t.Fatal("open and merged registrations not handled correctly")
@@ -71,7 +71,7 @@ func TestGraphQLPartialErrorDoesNotBlockOtherPRs(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s},"p1":null},"errors":[{"message":"forbidden","path":["p1","pullRequest"]}]}`, closedGraph))
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"bobzoller"},"p0":{"pullRequest":%s},"p1":null},"errors":[{"message":"forbidden","path":["p1","pullRequest"]}]}`, closedGraph))
 	if e = os.WriteFile(filepath.Join(d, "gqlfail"), nil, 0600); e != nil {
 		t.Fatal(e)
 	}
@@ -115,7 +115,7 @@ func TestGraphQLPaginationFallsBackToREST(t *testing.T) {
 	if e = showInbox(db, r.URL, r.Thread, &q); e != nil {
 		t.Fatal(e)
 	}
-	if !strings.Contains(q.String(), "review 1") || !strings.Contains(q.String(), "Bot feedback") {
+	if !strings.Contains(q.String(), "review 1") || !strings.Contains(q.String(), "Comment 4") {
 		t.Fatalf("missing feedback %s", q.String())
 	}
 }
@@ -180,7 +180,7 @@ func TestGraphQLCommentTextCannotTriggerRateLimit(t *testing.T) {
 	rateLimitedUntil = time.Time{}
 	rateFailures = 0
 	graph := strings.Replace(openGraph, "finding", "rate limit", 1)
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s}}}`, graph))
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"bobzoller"},"p0":{"pullRequest":%s}}}`, graph))
 	if _, e := ghGraphQL([]registration{*r}); e != nil {
 		t.Fatalf("comment content triggered rate limiter: %v", e)
 	}
@@ -235,7 +235,7 @@ func TestRejectedGraphQLBatchSplitsAndContinues(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s}}}`, closedGraph))
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"bobzoller"},"p0":{"pullRequest":%s}}}`, closedGraph))
 	script(t, filepath.Join(d, "bin"), "gh", `echo call >> "$HOME/split_calls"; case "$5" in *"p1: repository"*) echo '{"errors":[{"message":"resource limit exceeded"}]}'; exit 1;; *) cat "$HOME/graphql.json";; esac`)
 	poll(db, c)
 	if active(db, *r) || active(db, r2) {
@@ -248,5 +248,53 @@ func TestRejectedGraphQLBatchSplitsAndContinues(t *testing.T) {
 	q, _ := os.ReadFile(filepath.Join(d, "queued"))
 	if strings.Count(string(q), "merged; monitoring removed") != 2 {
 		t.Fatalf("missing terminal notification: %s", q)
+	}
+}
+
+func TestAllAuthorsAndDeduplication(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		name := "GraphQL"
+		if fallback {
+			name = "REST"
+		}
+		t.Run(name, func(t *testing.T) {
+			r, d, c := setup(t)
+			db, err := dbOpen(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
+				t.Fatal(err)
+			}
+			graph := `{"state":"OPEN","headRefOid":"abc","reviews":{"nodes":[{"fullDatabaseId":"11","state":"APPROVED","submittedAt":"date","author":{"login":"self","__typename":"User"}},{"fullDatabaseId":"12","state":"COMMENTED","submittedAt":"date","author":{"login":"other","__typename":"User"}},{"fullDatabaseId":"13","state":"COMMENTED","submittedAt":"date","author":{"login":"newbot","__typename":"Bot"}},{"fullDatabaseId":"14","state":"COMMENTED","submittedAt":"date","author":null},{"fullDatabaseId":"15","state":"PENDING","submittedAt":null}],"pageInfo":{"hasNextPage":false}},"comments":{"nodes":[{"fullDatabaseId":"21","updatedAt":"date","author":{"login":"self","__typename":"User"}},{"fullDatabaseId":"22","updatedAt":"date","author":{"login":"newbot","__typename":"Bot"}}],"pageInfo":{"hasNextPage":false}},"reviewThreads":{"nodes":[{"comments":{"nodes":[{"fullDatabaseId":"23","state":"SUBMITTED","updatedAt":"date","author":null},{"fullDatabaseId":"24","state":"PENDING","updatedAt":"date"}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}`
+			if fallback {
+				writeGraph(t, d, `{"errors":[{"message":"Cannot query field fullDatabaseId"}]}`)
+			} else {
+				writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s}}}`, graph))
+			}
+			script(t, filepath.Join(d, "bin"), "gh", `if [ "$3" = graphql ]; then cat "$HOME/graphql.json"; exit 0; fi
+case "$4" in
+ */pulls/1) echo '[{"state":"open","head":{"sha":"abc"}}]' ;;
+ */reviews*) echo '[[{"id":11,"state":"APPROVED","submitted_at":"date","user":{"login":"self","type":"User"}},{"id":12,"state":"COMMENTED","submitted_at":"date","user":{"login":"other","type":"User"}},{"id":13,"state":"COMMENTED","submitted_at":"date","user":{"login":"newbot","type":"Bot"}},{"id":14,"state":"COMMENTED","submitted_at":"date","user":null},{"id":15,"state":"PENDING","submitted_at":null}]]' ;;
+ */issues/1/comments*) echo '[[{"id":21,"updated_at":"date","user":{"login":"self","type":"User"}},{"id":22,"updated_at":"date","user":{"login":"newbot","type":"Bot"}}]]' ;;
+ */pulls/1/comments*) echo '[[{"id":23,"updated_at":"date","user":null}]]' ;;
+ */check-runs*) echo '[{"check_runs":[]}]' ;;
+ */statuses*) echo '[[]]' ;;
+ *) exit 1 ;; esac`)
+			poll(db, c)
+			poll(db, c)
+			for _, key := range []string{"review:11:date", "review:12:date", "review:13:date", "review:14:date", "comment:21:date", "comment:22:date", "comment:23:date"} {
+				var count int
+				if err = db.QueryRow("SELECT count(*) FROM inbox_items WHERE event=?", key).Scan(&count); err != nil || count != 1 {
+					t.Errorf("%s count=%d err=%v", key, count, err)
+				}
+			}
+			for _, key := range []string{"review:15:date", "comment:24:date"} {
+				if already(db, r.URL, key) {
+					t.Errorf("draft was handled: %s", key)
+				}
+			}
+		})
 	}
 }

@@ -112,12 +112,12 @@ func TestScanDurableAndRetry(t *testing.T) {
 		t.Fatal(e)
 	}
 	details := inbox.String()
-	for _, want := range []string{"review 1", "Bot feedback", "check"} {
+	for _, want := range []string{"review 1", "review 3", "Comment 4", "Comment 5", "check"} {
 		if !strings.Contains(details, want) {
 			t.Fatalf("missing %s: %s", want, details)
 		}
 	}
-	for _, bad := range []string{"review 2", "review 3", "agent reply", "deploy"} {
+	for _, bad := range []string{"review 2", "deploy"} {
 		if strings.Contains(details, bad) {
 			t.Fatalf("unexpected %s: %s", bad, details)
 		}

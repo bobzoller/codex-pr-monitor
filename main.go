@@ -23,7 +23,6 @@ import (
 
 var prPattern = regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)/pull/([1-9][0-9]*)/?$`)
 var resumeWarning = regexp.MustCompile(`(?im)^warning: message was queued, but could not resume thread\b`)
-var bots = map[string]bool{"greptile-apps[bot]": true, "greptile[bot]": true, "coderabbitai[bot]": true, "github-advanced-security[bot]": true}
 
 type registration struct{ URL, Thread string }
 type actor struct{ Login, Type string }
@@ -258,30 +257,17 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 			lines = append(lines, l)
 		}
 	}
-	inlineReviews := map[int64]bool{}
-	for _, page := range reviewComments {
-		for _, c := range page {
-			if c.ReviewID != 0 {
-				inlineReviews[c.ReviewID] = true
-			}
-		}
-	}
 	for _, page := range reviews {
 		for _, v := range page {
-			if v.SubmittedAt != nil && v.User.Login == "bobzoller" && v.State != "PENDING" && (v.State != "APPROVED" || strings.TrimSpace(v.Body) != "" || inlineReviews[v.ID]) {
-				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Submitted review %d by bobzoller.", v.ID))
-			}
-			if v.SubmittedAt != nil && bots[strings.ToLower(v.User.Login)] && v.User.Type == "Bot" && (v.State != "APPROVED" || strings.TrimSpace(v.Body) != "" || inlineReviews[v.ID]) {
-				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Bot review %d by %s.", v.ID, v.User.Login))
+			if v.SubmittedAt != nil && v.State != "PENDING" {
+				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Submitted review %d by %s.", v.ID, v.User.Login))
 			}
 		}
 	}
 	for _, pages := range [][][]apiComment{issueComments, reviewComments} {
 		for _, page := range pages {
 			for _, v := range page {
-				if bots[strings.ToLower(v.User.Login)] && v.User.Type == "Bot" && strings.TrimSpace(v.Body) != "" {
-					add(fmt.Sprintf("comment:%d:%s", v.ID, v.UpdatedAt), fmt.Sprintf("Bot feedback %s by %s.", v.HTMLURL, v.User.Login))
-				}
+				add(fmt.Sprintf("comment:%d:%s", v.ID, v.UpdatedAt), fmt.Sprintf("Comment %d at %s by %s.", v.ID, v.HTMLURL, v.User.Login))
 			}
 		}
 	}
