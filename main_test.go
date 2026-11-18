@@ -8,9 +8,34 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+// Keep Go's read-only module cache outside temporary HOME directories. Linux
+// cannot remove downloaded read-only module files during TempDir cleanup.
+func TestMain(m *testing.M) {
+	out, err := exec.Command("go", "env", "GOMODCACHE", "GOCACHE").Output()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "go env:", err)
+		os.Exit(1)
+	}
+	paths := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(paths) != 2 {
+		fmt.Fprintln(os.Stderr, "unexpected go env output")
+		os.Exit(1)
+	}
+	if err = os.Setenv("GOMODCACHE", paths[0]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err = os.Setenv("GOCACHE", paths[1]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
 
 func script(t *testing.T, dir, name, body string) string {
 	t.Helper()
@@ -278,31 +303,43 @@ func TestStartStop(t *testing.T) {
 			t.Fatalf("%s: %s %v", arg, out, e)
 		}
 	}
-	run("start")
-	run("start")
 	pid := filepath.Join(d, ".config", "codex-pr-monitor", "pid")
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, e := os.Stat(pid); e == nil {
-			break
+	lock := filepath.Join(d, ".config", "codex-pr-monitor", "lock")
+	for i := 0; i < 10; i++ {
+		run("start")
+		run("start")
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, e := os.Stat(pid); e == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("daemon did not start")
+			}
+			time.Sleep(time.Millisecond)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("daemon did not start")
+		run("stop")
+		deadline = time.Now().Add(5 * time.Second)
+		for {
+			_, err := os.Stat(pid)
+			if os.IsNotExist(err) {
+				f, e := os.OpenFile(lock, os.O_RDWR, 0600)
+				if e != nil {
+					t.Fatal(e)
+				}
+				e = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+				f.Close()
+				if e == nil {
+					break
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("daemon did not stop")
+			}
+			time.Sleep(time.Millisecond)
 		}
-		time.Sleep(20 * time.Millisecond)
+		run("stop")
 	}
-	run("stop")
-	deadline = time.Now().Add(5 * time.Second)
-	for {
-		if _, e := os.Stat(pid); os.IsNotExist(e) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("daemon did not stop")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	run("stop")
 }
 
 func TestOwnerSwitchHelper(t *testing.T) {

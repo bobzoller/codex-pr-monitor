@@ -418,17 +418,24 @@ func daemon(d, path string) error {
 		return errors.New("missing lock")
 	}
 	defer f.Close()
-	if e := os.WriteFile(filepath.Join(d, "pid"), []byte(fmt.Sprint(os.Getpid())), 0600); e != nil {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
+	defer signal.Stop(sig)
+	pidPath := filepath.Join(d, "pid")
+	tmpPath := filepath.Join(d, "pid.tmp")
+	if e := os.WriteFile(tmpPath, []byte(fmt.Sprint(os.Getpid())), 0600); e != nil {
 		return e
 	}
-	defer os.Remove(filepath.Join(d, "pid"))
+	defer os.Remove(tmpPath)
+	if e := os.Rename(tmpPath, pidPath); e != nil {
+		return e
+	}
+	defer os.Remove(pidPath)
 	db, e := dbOpen(d)
 	if e != nil {
 		return e
 	}
 	defer db.Close()
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	poll(db, path)
