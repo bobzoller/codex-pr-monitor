@@ -98,7 +98,6 @@ func TestGraphQLPaginationFallsBackToREST(t *testing.T) {
 	if e = json.Unmarshal([]byte(openGraph), &s); e != nil {
 		t.Fatal(e)
 	}
-	s.viewer = "bobzoller"
 	s.Reviews.Page.HasNextPage = true
 	s.Comments.Page.HasNextPage = true
 	s.Threads.Nodes[0].Comments.Page.HasNextPage = true
@@ -116,7 +115,7 @@ func TestGraphQLPaginationFallsBackToREST(t *testing.T) {
 	if e = showInbox(db, r.URL, r.Thread, &q); e != nil {
 		t.Fatal(e)
 	}
-	if !strings.Contains(q.String(), "review 1") || !strings.Contains(q.String(), "Bot feedback") {
+	if !strings.Contains(q.String(), "review 1") || !strings.Contains(q.String(), "Comment 4") {
 		t.Fatalf("missing feedback %s", q.String())
 	}
 }
@@ -252,65 +251,50 @@ func TestRejectedGraphQLBatchSplitsAndContinues(t *testing.T) {
 	}
 }
 
-func TestViewerFailurePreservesReviewForRetry(t *testing.T) {
-	r, d, c := setup(t)
-	db, err := dbOpen(d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
-		t.Fatal(err)
-	}
-	graph := strings.Replace(openGraph, `"login":"bobzoller"`, `"login":"NewUser"`, 1)
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"NewUser"},"p0":{"pullRequest":%s}},"errors":[{"message":"viewer error","path":["viewer","login"]}]}`, graph))
-	poll(db, c)
-	if already(db, r.URL, "review:1:2026-01-01") {
-		t.Fatal("unknown viewer review was marked handled")
-	}
-	if !already(db, r.URL, "comment:4:2026-01-01") || !already(db, r.URL, "check:abc:6:failure:2026-01-01") {
-		t.Fatal("bot or CI event was lost")
-	}
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"newuser"},"p0":{"pullRequest":%s}}}`, graph))
-	poll(db, c)
-	if !already(db, r.URL, "review:1:2026-01-01") {
-		t.Fatal("viewer review not retried case-insensitively")
-	}
-}
-
-func TestGraphQLIncludesViewer(t *testing.T) {
-	q, err := gqlQuery([]registration{{URL: "https://github.com/acme/repo/pull/1"}})
-	if err != nil || !strings.Contains(q, "viewer { login }") {
-		t.Fatalf("viewer missing: %s %v", q, err)
-	}
-}
-
-func TestRESTFallbackViewerRecovery(t *testing.T) {
-	r, d, c := setup(t)
-	db, err := dbOpen(d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
-		t.Fatal(err)
-	}
-	writeGraph(t, d, `{"errors":[{"message":"Cannot query field fullDatabaseId"}]}`)
-	if err = os.WriteFile(filepath.Join(d, "userfail"), nil, 0600); err != nil {
-		t.Fatal(err)
-	}
-	poll(db, c)
-	if already(db, r.URL, "review:1:2026-01-01") || !already(db, r.URL, "comment:4:2026-01-01") {
-		t.Fatal("identity failure lost or prematurely handled events")
-	}
-	if err = os.Remove(filepath.Join(d, "userfail")); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(filepath.Join(d, "user.json"), []byte(`[{"login":"other"}]`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	poll(db, c)
-	if !already(db, r.URL, "review:3:2026-01-01") || already(db, r.URL, "review:1:2026-01-01") {
-		t.Fatal("REST fallback selected wrong reviewer")
+func TestAllAuthorsAndDeduplication(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		name := "GraphQL"
+		if fallback {
+			name = "REST"
+		}
+		t.Run(name, func(t *testing.T) {
+			r, d, c := setup(t)
+			db, err := dbOpen(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
+				t.Fatal(err)
+			}
+			graph := `{"state":"OPEN","headRefOid":"abc","reviews":{"nodes":[{"fullDatabaseId":"11","state":"APPROVED","submittedAt":"date","author":{"login":"self","__typename":"User"}},{"fullDatabaseId":"12","state":"COMMENTED","submittedAt":"date","author":{"login":"other","__typename":"User"}},{"fullDatabaseId":"13","state":"COMMENTED","submittedAt":"date","author":{"login":"newbot","__typename":"Bot"}},{"fullDatabaseId":"14","state":"COMMENTED","submittedAt":"date","author":null},{"fullDatabaseId":"15","state":"PENDING","submittedAt":null}],"pageInfo":{"hasNextPage":false}},"comments":{"nodes":[{"fullDatabaseId":"21","updatedAt":"date","author":{"login":"self","__typename":"User"}},{"fullDatabaseId":"22","updatedAt":"date","author":{"login":"newbot","__typename":"Bot"}}],"pageInfo":{"hasNextPage":false}},"reviewThreads":{"nodes":[{"comments":{"nodes":[{"fullDatabaseId":"23","state":"SUBMITTED","updatedAt":"date","author":null},{"fullDatabaseId":"24","state":"PENDING","updatedAt":"date"}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}`
+			if fallback {
+				writeGraph(t, d, `{"errors":[{"message":"Cannot query field fullDatabaseId"}]}`)
+			} else {
+				writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s}}}`, graph))
+			}
+			script(t, filepath.Join(d, "bin"), "gh", `if [ "$3" = graphql ]; then cat "$HOME/graphql.json"; exit 0; fi
+case "$4" in
+ */pulls/1) echo '[{"state":"open","head":{"sha":"abc"}}]' ;;
+ */reviews*) echo '[[{"id":11,"state":"APPROVED","submitted_at":"date","user":{"login":"self","type":"User"}},{"id":12,"state":"COMMENTED","submitted_at":"date","user":{"login":"other","type":"User"}},{"id":13,"state":"COMMENTED","submitted_at":"date","user":{"login":"newbot","type":"Bot"}},{"id":14,"state":"COMMENTED","submitted_at":"date","user":null},{"id":15,"state":"PENDING","submitted_at":null}]]' ;;
+ */issues/1/comments*) echo '[[{"id":21,"updated_at":"date","user":{"login":"self","type":"User"}},{"id":22,"updated_at":"date","user":{"login":"newbot","type":"Bot"}}]]' ;;
+ */pulls/1/comments*) echo '[[{"id":23,"updated_at":"date","user":null}]]' ;;
+ */check-runs*) echo '[{"check_runs":[]}]' ;;
+ */statuses*) echo '[[]]' ;;
+ *) exit 1 ;; esac`)
+			poll(db, c)
+			poll(db, c)
+			for _, key := range []string{"review:11:date", "review:12:date", "review:13:date", "review:14:date", "comment:21:date", "comment:22:date", "comment:23:date"} {
+				var count int
+				if err = db.QueryRow("SELECT count(*) FROM inbox_items WHERE event=?", key).Scan(&count); err != nil || count != 1 {
+					t.Errorf("%s count=%d err=%v", key, count, err)
+				}
+			}
+			for _, key := range []string{"review:15:date", "comment:24:date"} {
+				if already(db, r.URL, key) {
+					t.Errorf("draft was handled: %s", key)
+				}
+			}
+		})
 	}
 }
