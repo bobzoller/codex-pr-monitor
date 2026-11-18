@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Test
+        run: CGO_ENABLED=0 go test ./...
+      - name: Build release archives
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [[ "$REF_TYPE" != tag ]]; then RELEASE_VERSION=v0.0.0-ci; fi
+          scripts/build-release.sh "$RELEASE_VERSION" dist
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          args=()
+          if [[ "${RELEASE_VERSION%%+*}" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_VERSION" dist/*.tar.gz dist/SHA256SUMS.txt \
+            --verify-tag --generate-notes --title "$RELEASE_VERSION" "${args[@]}"

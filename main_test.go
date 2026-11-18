@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -240,7 +241,11 @@ func TestTerminalQueuePreservesNewOwner(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(d, "pull.json"), []byte(`[{"state":"closed","closed_at":"2026-01-01T10:00:00Z"}]`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	codex := script(t, d, "switch-owner", `sqlite3 "$HOME/state.db" "UPDATE prs SET thread='new-owner'"`)
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex := script(t, d, "switch-owner", "CODEX_MONITOR_TEST_SWITCH_OWNER=1 exec "+shellArg(testExe)+" -test.run '^TestOwnerSwitchHelper$'")
 	if err = scan(db, *r, codex); err != nil {
 		t.Fatal(err)
 	}
@@ -298,4 +303,21 @@ func TestStartStop(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	run("stop")
+}
+
+func TestOwnerSwitchHelper(t *testing.T) {
+	if os.Getenv("CODEX_MONITOR_TEST_SWITCH_OWNER") != "1" {
+		return
+	}
+	db, err := dbOpen(os.Getenv("HOME"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if _, err = db.Exec("UPDATE prs SET thread='new-owner'"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	db.Close()
+	os.Exit(0)
 }
