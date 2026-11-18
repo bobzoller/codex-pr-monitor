@@ -55,6 +55,7 @@ func setup(t *testing.T) (*registration, string, string) {
 	}
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	script(t, bin, "gh", `echo "$GH_TOKEN" > "$HOME/auth"; if [ -f "$HOME/ghfail" ]; then exit 1; fi; echo "$3 $4" >> "$HOME/requests"; if [ "$3" = graphql ]; then cat "$HOME/graphql.json"; if [ -f "$HOME/gqlfail" ]; then exit 1; fi; exit 0; fi; case "$4" in
+ user) if [ -f "$HOME/userfail" ]; then exit 1; elif [ -f "$HOME/user.json" ]; then cat "$HOME/user.json"; else echo '[{"login":"bobzoller"}]'; fi ;;
  */pulls/1) if [ -f "$HOME/pull.json" ]; then cat "$HOME/pull.json"; else echo '[{"state":"open","head":{"sha":"abc"}}]'; fi ;;
  */reviews*) echo '[[{"id":1,"user":{"login":"bobzoller","type":"User"},"state":"COMMENTED","submitted_at":"2026-01-01","body":""},{"id":2,"user":{"login":"bobzoller","type":"User"},"state":"PENDING","submitted_at":null,"body":"draft"},{"id":3,"user":{"login":"other","type":"User"},"state":"CHANGES_REQUESTED","submitted_at":"2026-01-01","body":"x"}]]' ;;
  */issues/1/comments*) echo '[[{"id":4,"user":{"login":"greptile-apps[bot]","type":"Bot"},"body":"finding","updated_at":"2026-01-01","html_url":"https://example/4"},{"id":5,"user":{"login":"bobzoller","type":"User"},"body":"agent reply","updated_at":"2026-01-01"}]]' ;;

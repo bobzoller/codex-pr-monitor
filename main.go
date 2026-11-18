@@ -157,6 +157,16 @@ func queue(path string, r registration, msg string) error {
 	return nil
 }
 func scan(db *sql.DB, r registration, path string) error { return scanSnapshot(db, r, path, nil) }
+func restViewer() string {
+	var users []struct {
+		Login string `json:"login"`
+	}
+	if err := gh("user", &users); err != nil || len(users) != 1 || strings.TrimSpace(users[0].Login) == "" {
+		log.Printf("GitHub viewer identity unavailable; user reviews will be retried")
+		return ""
+	}
+	return users[0].Login
+}
 func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot) error {
 	_, m, e := validURL(r.URL)
 	if e != nil {
@@ -217,6 +227,12 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 	if p.State != "open" {
 		return fmt.Errorf("unexpected PR state %q", p.State)
 	}
+	viewer := ""
+	if snapshot != nil {
+		viewer = snapshot.viewer
+	} else {
+		viewer = restViewer()
+	}
 	head := url.PathEscape(p.Head.SHA)
 	var reviews [][]apiReview
 	var issueComments, reviewComments [][]apiComment
@@ -268,8 +284,8 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 	}
 	for _, page := range reviews {
 		for _, v := range page {
-			if v.SubmittedAt != nil && v.User.Login == "bobzoller" && v.State != "PENDING" && (v.State != "APPROVED" || strings.TrimSpace(v.Body) != "" || inlineReviews[v.ID]) {
-				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Submitted review %d by bobzoller.", v.ID))
+			if v.SubmittedAt != nil && viewer != "" && v.User.Type == "User" && strings.EqualFold(v.User.Login, viewer) && v.State != "PENDING" && (v.State != "APPROVED" || strings.TrimSpace(v.Body) != "" || inlineReviews[v.ID]) {
+				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Submitted review %d by %s.", v.ID, v.User.Login))
 			}
 			if v.SubmittedAt != nil && bots[strings.ToLower(v.User.Login)] && v.User.Type == "Bot" && (v.State != "APPROVED" || strings.TrimSpace(v.Body) != "" || inlineReviews[v.ID]) {
 				add(fmt.Sprintf("review:%d:%s", v.ID, *v.SubmittedAt), fmt.Sprintf("Bot review %d by %s.", v.ID, v.User.Login))

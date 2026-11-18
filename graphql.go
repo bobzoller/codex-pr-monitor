@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/textproto"
 	"os"
@@ -60,6 +61,7 @@ type pageInfo struct {
 	HasNextPage bool `json:"hasNextPage"`
 }
 type gqlSnapshot struct {
+	viewer   string
 	State    string `json:"state"`
 	ClosedAt string `json:"closedAt"`
 	MergedAt string `json:"mergedAt"`
@@ -194,7 +196,7 @@ func noteRateLimit(h http.Header) {
 func githubAvailable() bool { return !time.Now().Before(rateLimitedUntil) }
 func gqlQuery(rs []registration) (string, error) {
 	var b strings.Builder
-	b.WriteString("query Monitor {\n")
+	b.WriteString("query Monitor {\nviewer { login }\n")
 	for i, r := range rs {
 		_, m, e := validURL(r.URL)
 		if e != nil {
@@ -267,6 +269,7 @@ func ghGraphQL(rs []registration) ([]snapshotResult, error) {
 	results := make([]snapshotResult, len(rs))
 	globalErr := false
 	unsupported := false
+	viewerFailed := false
 	for _, v := range resp.Errors {
 		if strings.Contains(v.Message, "doesn't exist on type") || strings.Contains(v.Message, "Cannot query field") {
 			unsupported = true
@@ -276,6 +279,10 @@ func ghGraphQL(rs []registration) ([]snapshotResult, error) {
 			continue
 		}
 		alias, ok := v.Path[0].(string)
+		if ok && alias == "viewer" {
+			viewerFailed = true
+			continue
+		}
 		if !ok || !strings.HasPrefix(alias, "p") {
 			globalErr = true
 			continue
@@ -293,6 +300,13 @@ func ghGraphQL(rs []registration) ([]snapshotResult, error) {
 		}
 		return nil, errGraphQLRejected
 	}
+	var viewer struct {
+		Login string `json:"login"`
+	}
+	if viewerFailed || json.Unmarshal(resp.Data["viewer"], &viewer) != nil || strings.TrimSpace(viewer.Login) == "" {
+		log.Print("GitHub viewer identity unavailable; user reviews will be retried")
+		viewer.Login = ""
+	}
 	for i := range results {
 		if results[i].err != nil {
 			continue
@@ -305,6 +319,7 @@ func ghGraphQL(rs []registration) ([]snapshotResult, error) {
 			results[i].err = errors.New("PR unavailable in GraphQL response")
 			continue
 		}
+		v.Pull.viewer = viewer.Login
 		results[i].snap = v.Pull
 	}
 	return results, nil

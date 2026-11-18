@@ -40,7 +40,7 @@ func TestGraphQLBatchAndDurableLegacyIDs(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s},"p1":{"pullRequest":%s}}}`, openGraph, closedGraph))
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"bobzoller"},"p0":{"pullRequest":%s},"p1":{"pullRequest":%s}}}`, openGraph, closedGraph))
 	poll(db, c)
 	if !active(db, *r) || active(db, r2) {
 		t.Fatal("open and merged registrations not handled correctly")
@@ -71,7 +71,7 @@ func TestGraphQLPartialErrorDoesNotBlockOtherPRs(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s},"p1":null},"errors":[{"message":"forbidden","path":["p1","pullRequest"]}]}`, closedGraph))
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"bobzoller"},"p0":{"pullRequest":%s},"p1":null},"errors":[{"message":"forbidden","path":["p1","pullRequest"]}]}`, closedGraph))
 	if e = os.WriteFile(filepath.Join(d, "gqlfail"), nil, 0600); e != nil {
 		t.Fatal(e)
 	}
@@ -98,6 +98,7 @@ func TestGraphQLPaginationFallsBackToREST(t *testing.T) {
 	if e = json.Unmarshal([]byte(openGraph), &s); e != nil {
 		t.Fatal(e)
 	}
+	s.viewer = "bobzoller"
 	s.Reviews.Page.HasNextPage = true
 	s.Comments.Page.HasNextPage = true
 	s.Threads.Nodes[0].Comments.Page.HasNextPage = true
@@ -180,7 +181,7 @@ func TestGraphQLCommentTextCannotTriggerRateLimit(t *testing.T) {
 	rateLimitedUntil = time.Time{}
 	rateFailures = 0
 	graph := strings.Replace(openGraph, "finding", "rate limit", 1)
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s}}}`, graph))
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"bobzoller"},"p0":{"pullRequest":%s}}}`, graph))
 	if _, e := ghGraphQL([]registration{*r}); e != nil {
 		t.Fatalf("comment content triggered rate limiter: %v", e)
 	}
@@ -235,7 +236,7 @@ func TestRejectedGraphQLBatchSplitsAndContinues(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	writeGraph(t, d, fmt.Sprintf(`{"data":{"p0":{"pullRequest":%s}}}`, closedGraph))
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"bobzoller"},"p0":{"pullRequest":%s}}}`, closedGraph))
 	script(t, filepath.Join(d, "bin"), "gh", `echo call >> "$HOME/split_calls"; case "$5" in *"p1: repository"*) echo '{"errors":[{"message":"resource limit exceeded"}]}'; exit 1;; *) cat "$HOME/graphql.json";; esac`)
 	poll(db, c)
 	if active(db, *r) || active(db, r2) {
@@ -248,5 +249,68 @@ func TestRejectedGraphQLBatchSplitsAndContinues(t *testing.T) {
 	q, _ := os.ReadFile(filepath.Join(d, "queued"))
 	if strings.Count(string(q), "merged; monitoring removed") != 2 {
 		t.Fatalf("missing terminal notification: %s", q)
+	}
+}
+
+func TestViewerFailurePreservesReviewForRetry(t *testing.T) {
+	r, d, c := setup(t)
+	db, err := dbOpen(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
+		t.Fatal(err)
+	}
+	graph := strings.Replace(openGraph, `"login":"bobzoller"`, `"login":"NewUser"`, 1)
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"NewUser"},"p0":{"pullRequest":%s}},"errors":[{"message":"viewer error","path":["viewer","login"]}]}`, graph))
+	poll(db, c)
+	if already(db, r.URL, "review:1:2026-01-01") {
+		t.Fatal("unknown viewer review was marked handled")
+	}
+	if !already(db, r.URL, "comment:4:2026-01-01") || !already(db, r.URL, "check:abc:6:failure:2026-01-01") {
+		t.Fatal("bot or CI event was lost")
+	}
+	writeGraph(t, d, fmt.Sprintf(`{"data":{"viewer":{"login":"newuser"},"p0":{"pullRequest":%s}}}`, graph))
+	poll(db, c)
+	if !already(db, r.URL, "review:1:2026-01-01") {
+		t.Fatal("viewer review not retried case-insensitively")
+	}
+}
+
+func TestGraphQLIncludesViewer(t *testing.T) {
+	q, err := gqlQuery([]registration{{URL: "https://github.com/acme/repo/pull/1"}})
+	if err != nil || !strings.Contains(q, "viewer { login }") {
+		t.Fatalf("viewer missing: %s %v", q, err)
+	}
+}
+
+func TestRESTFallbackViewerRecovery(t *testing.T) {
+	r, d, c := setup(t)
+	db, err := dbOpen(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
+		t.Fatal(err)
+	}
+	writeGraph(t, d, `{"errors":[{"message":"Cannot query field fullDatabaseId"}]}`)
+	if err = os.WriteFile(filepath.Join(d, "userfail"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	poll(db, c)
+	if already(db, r.URL, "review:1:2026-01-01") || !already(db, r.URL, "comment:4:2026-01-01") {
+		t.Fatal("identity failure lost or prematurely handled events")
+	}
+	if err = os.Remove(filepath.Join(d, "userfail")); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(d, "user.json"), []byte(`[{"login":"other"}]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	poll(db, c)
+	if !already(db, r.URL, "review:3:2026-01-01") || already(db, r.URL, "review:1:2026-01-01") {
+		t.Fatal("REST fallback selected wrong reviewer")
 	}
 }
