@@ -41,13 +41,7 @@ func saveEvents(db *sql.DB, r registration, keys, details []string) error {
 		if e != nil {
 			return e
 		}
-		var pendingOther int
-		if n == 0 {
-			if e = tx.QueryRow("SELECT count(*) FROM inbox_items WHERE url=? AND thread<>? AND event=?", r.URL, r.Thread, k).Scan(&pendingOther); e != nil {
-				return e
-			}
-		}
-		if n != 0 || pendingOther > 0 {
+		if n != 0 {
 			if _, e = tx.Exec("INSERT OR IGNORE INTO inbox_items(url,thread,event,detail) VALUES(?,?,?,?)", r.URL, r.Thread, k, details[i]); e != nil {
 				return e
 			}
@@ -55,10 +49,20 @@ func saveEvents(db *sql.DB, r registration, keys, details []string) error {
 	}
 	return tx.Commit()
 }
-func pendingForAnotherOwner(db *sql.DB, r registration, key string) bool {
-	var n int
-	_ = db.QueryRow("SELECT count(*) FROM inbox_items WHERE url=? AND thread<>? AND event=?", r.URL, r.Thread, key).Scan(&n)
-	return n > 0
+
+// Move pending items once when ownership changes, preserving unhandled events.
+func rehomeInbox(tx *sql.Tx) error {
+	queries := []string{
+		`INSERT OR IGNORE INTO inbox_items(url,thread,event,detail) SELECT i.url,p.thread,i.event,i.detail FROM inbox_items i JOIN prs p ON p.url=i.url WHERE i.thread<>p.thread`,
+		`DELETE FROM inbox_items WHERE EXISTS (SELECT 1 FROM prs p WHERE p.url=inbox_items.url AND p.thread<>inbox_items.thread)`,
+		`DELETE FROM inbox_wakes WHERE EXISTS (SELECT 1 FROM prs p WHERE p.url=inbox_wakes.url AND p.thread<>inbox_wakes.thread)`,
+	}
+	for _, q := range queries {
+		if _, err := tx.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func shellArg(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 func wakeMessage(r registration, terminal string) string {

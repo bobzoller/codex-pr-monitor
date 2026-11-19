@@ -86,6 +86,19 @@ func dbOpen(d string) (*sql.DB, error) {
 		db.Close()
 		return nil, e
 	}
+	tx, e := db.Begin()
+	if e == nil {
+		e = rehomeInbox(tx)
+		if e == nil {
+			e = tx.Commit()
+		} else {
+			_ = tx.Rollback()
+		}
+	}
+	if e != nil {
+		db.Close()
+		return nil, e
+	}
 	return db, nil
 }
 func validURL(s string) (string, []string, error) {
@@ -157,6 +170,17 @@ func queue(path string, r registration, msg string) error {
 }
 func scan(db *sql.DB, r registration, path string) error { return scanSnapshot(db, r, path, nil) }
 func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if err = rehomeInbox(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
 	_, m, e := validURL(r.URL)
 	if e != nil {
 		return e
@@ -191,7 +215,7 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 			return errors.New("closed PR is missing its closure timestamp")
 		}
 		key := "terminal:" + state + ":" + at
-		if !already(db, r.URL, key) || pendingForAnotherOwner(db, r, key) {
+		if !already(db, r.URL, key) {
 			detail := fmt.Sprintf("PR %s at %s. Monitoring removed; register again if reopened.", state, at)
 			if e := saveEvents(db, r, []string{key}, []string{detail}); e != nil {
 				return e
@@ -252,7 +276,7 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 	}
 	var keys, lines []string
 	add := func(k, l string) {
-		if !already(db, r.URL, k) || pendingForAnotherOwner(db, r, k) {
+		if !already(db, r.URL, k) {
 			keys = append(keys, k)
 			lines = append(lines, l)
 		}
@@ -538,7 +562,18 @@ func run(args []string) error {
 			if strings.TrimSpace(*t) == "" {
 				return errors.New("--thread is required")
 			}
-			_, e = db.Exec("INSERT INTO prs(url,thread) VALUES(?,?) ON CONFLICT(url) DO UPDATE SET thread=excluded.thread", normalized, *t)
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			if _, err = tx.Exec("INSERT INTO prs(url,thread) VALUES(?,?) ON CONFLICT(url) DO UPDATE SET thread=excluded.thread", normalized, *t); err != nil {
+				return err
+			}
+			if err = rehomeInbox(tx); err != nil {
+				return err
+			}
+			e = tx.Commit()
 		} else if args[0] == "remove" {
 			tx, err := db.Begin()
 			if err != nil {

@@ -182,6 +182,47 @@ func TestOnlyOneDelayedRecoveryRetry(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+func TestOwnershipTransferMovesPendingOnce(t *testing.T) {
+	db, old, _, codex := registeredInbox(t)
+	if err := saveEvents(db, *old, []string{"review:1"}, []string{"review"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sendWake(db, codex, *old); err != nil {
+		t.Fatal(err)
+	}
+	newOwner := registration{old.URL, "new-owner"}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec("UPDATE prs SET thread=? WHERE url=?", newOwner.Thread, old.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err = rehomeInbox(tx); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err = db.QueryRow("SELECT count(*) FROM inbox_items WHERE url=? AND thread=?", old.URL, old.Thread).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("old pending items: %d, %v", count, err)
+	}
+	if _, err = sendWake(db, codex, newOwner); err != nil {
+		t.Fatal(err)
+	}
+	wake, through := ids(t, db, newOwner)
+	if err = ackInbox(db, newOwner.URL, newOwner.Thread, wake, through); err != nil {
+		t.Fatal(err)
+	}
+	if err = saveEvents(db, newOwner, []string{"review:1"}, []string{"review"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow("SELECT count(*) FROM inbox_items WHERE url=?", old.URL).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("handled event reappeared: %d, %v", count, err)
+	}
+}
 func TestFailedAckDoesNotEraseOtherEvents(t *testing.T) {
 	db, r, _, c := registeredInbox(t)
 	if e := saveEvents(db, *r, []string{"a"}, []string{"first"}); e != nil {
