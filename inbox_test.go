@@ -229,7 +229,7 @@ func TestInboxCLIAndExplicitRemove(t *testing.T) {
 	if e = saveEvents(db, *r, []string{"b"}, []string{"more"}); e != nil {
 		t.Fatal(e)
 	}
-	if e = run([]string{"remove", "--url", r.URL}); e != nil {
+	if e = run([]string{"remove", "--url", r.URL, "--thread", r.Thread}); e != nil {
 		t.Fatal(e)
 	}
 	flushInbox(db, c)

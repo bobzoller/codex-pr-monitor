@@ -20,21 +20,23 @@ install -m 755 codex-pr-monitor ~/.bin/codex-pr-monitor
 install -m 644 skills/codex-pr-monitor/SKILL.md ~/.codex/skills/codex-pr-monitor/SKILL.md
 ```
 
+Stop any running older daemon before upgrading to a multi-owner version; older binaries do not understand the migrated database.
+
 Or clone the repository and build with Go 1.21.13 or newer using `CGO_ENABLED=0 go install .`. Copy `skills/codex-pr-monitor` into your Codex skills directory. Put the binary directory on PATH, then register and start:
 
 ```sh
 codex-pr-monitor add --url https://github.com/OWNER/REPO/pull/123 --thread THREAD_ID
 codex-pr-monitor start
 codex-pr-monitor stop
-codex-pr-monitor remove --url https://github.com/OWNER/REPO/pull/123
+codex-pr-monitor remove --url https://github.com/OWNER/REPO/pull/123 --thread THREAD_ID
 codex-pr-monitor inbox --url https://github.com/OWNER/REPO/pull/123 --thread THREAD_ID
 ```
 
-Each PR has one owning thread; adding the same URL updates its owner. Removal retains event history and discards pending inbox items and wakes, so re-adding does not replay previously seen events.
+Multiple threads may watch a PR independently. Adding an existing thread is idempotent. A first registration receives currently visible events that have not already been checkpointed. A thread joining an already watched PR receives events timestamped after it joined; events already checkpointed are not replayed. GitHub timestamps have limited precision and clocks may differ, so events at or near the join time can be omitted or misclassified; events without a usable timestamp are omitted for late joiners. Re-registering after all owners leave retains the URL-wide event history. Removal discards only the selected thread's pending inbox and wake. Use `--thread` to remove one owner or `--all-threads` to remove everyone. A message already queued cannot be recalled.
 
 The daemon batches PR state and review feedback for up to five PRs per GitHub GraphQL request, with paginated REST fallbacks when needed. It checks CI through REST to preserve existing event identities. Rejected batches are split or retried, partial failures leave affected PRs for a later check, and GitHub rate-limit responses pause requests until the indicated retry or reset time (with backoff when no time is supplied). It polls registered PRs at startup and every minute thereafter, at any hour. With no registrations it makes no GitHub requests. The first poll after downtime catches events still visible in GitHub’s current results; transient failures that resolve while offline can be missed. The machine must be awake and the daemon running; it does not launch automatically at login. `start` is reentrant and `stop` is repeatable. State, lock, PID, and `monitor.log` are under `~/.config/codex-pr-monitor`; the log is truncated on each new daemon start. The database includes PR URLs, thread IDs, and event identities; credentials are never written to the log.
 
-The monitor notifies the owning chat when a registered PR is merged or closed, including if it was already closed when registered. After a wake has been queued, it removes the registration automatically and retains the terminal item in the inbox until acknowledged. If the PR is reopened, register it again to resume monitoring; a later closure can trigger a new notification. Queue failures retain the registration for retry. Previously notified terminal registrations left by an older version are removed without sending another notification.
+The monitor notifies each owning chat when a registered PR is merged or closed, including if it was already closed when registered. After each owner’s wake has been queued, it removes that registration automatically and retains the terminal item in the inbox until acknowledged. If the PR is reopened, register it again to resume monitoring; a later closure can trigger a new notification. Queue failures retain the registration for retry. Previously notified terminal registrations left by an older version are removed without sending another notification.
 
 For open PRs, the monitor checks every submitted review and every issue or inline review comment, including the owning agent's own comments, along with failures on the current head. Draft reviews and draft inline comments are excluded. The owning agent must assess the events and use its own checkpoints to decide what action is needed; notifications may include its own activity or benign feedback. A submitted review edited after its original submission may not be re-notified. GitHub access failures preserve state and retry at the next poll.
 

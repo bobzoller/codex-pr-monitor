@@ -81,7 +81,41 @@ func dbOpen(d string) (*sql.DB, error) {
 		return nil, e
 	}
 	db.SetMaxOpenConns(1)
-	_, e = db.Exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS prs(url TEXT PRIMARY KEY, thread TEXT NOT NULL); CREATE TABLE IF NOT EXISTS seen(url TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(url,event)); CREATE TABLE IF NOT EXISTS inbox_items(id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, thread TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL, UNIQUE(url,thread,event)); CREATE TABLE IF NOT EXISTS inbox_wakes(id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, thread TEXT NOT NULL, attempts INTEGER NOT NULL, sent_at INTEGER NOT NULL, UNIQUE(url,thread));`)
+	_, e = db.Exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS prs(url TEXT NOT NULL, thread TEXT NOT NULL, PRIMARY KEY(url,thread)); CREATE TABLE IF NOT EXISTS joins(url TEXT NOT NULL, thread TEXT NOT NULL, cutoff TEXT NOT NULL, PRIMARY KEY(url,thread)); CREATE TABLE IF NOT EXISTS terminal_deliveries(url TEXT NOT NULL, thread TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(url,thread,event)); CREATE TABLE IF NOT EXISTS seen(url TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(url,event)); CREATE TABLE IF NOT EXISTS inbox_items(id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, thread TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL, UNIQUE(url,thread,event)); CREATE TABLE IF NOT EXISTS inbox_wakes(id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, thread TEXT NOT NULL, attempts INTEGER NOT NULL, sent_at INTEGER NOT NULL, UNIQUE(url,thread));`)
+	if e != nil {
+		db.Close()
+		return nil, e
+	}
+	// Lock before examining the schema so concurrent processes cannot migrate twice.
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err = conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		conn.Close()
+		db.Close()
+		return nil, err
+	}
+	var schema string
+	err = conn.QueryRowContext(context.Background(), "SELECT sql FROM sqlite_master WHERE type='table' AND name='prs'").Scan(&schema)
+	if err == nil && strings.Contains(strings.ToUpper(schema), "URL TEXT PRIMARY KEY") {
+		_, err = conn.ExecContext(context.Background(), `CREATE TABLE prs_multi(url TEXT NOT NULL, thread TEXT NOT NULL, PRIMARY KEY(url,thread)); INSERT INTO prs_multi SELECT url,thread FROM prs; DROP TABLE prs; ALTER TABLE prs_multi RENAME TO prs; INSERT OR IGNORE INTO inbox_items(url,thread,event,detail) SELECT p.url,p.thread,i.event,i.detail FROM prs p JOIN inbox_items i ON i.url=p.url AND i.thread<>p.thread;`)
+	}
+	if err == nil {
+		_, err = conn.ExecContext(context.Background(), "COMMIT")
+	} else {
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+	}
+	conn.Close()
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS subscription_generation(id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, thread TEXT NOT NULL, UNIQUE(url,thread));
+CREATE TRIGGER IF NOT EXISTS prs_new_generation AFTER INSERT ON prs BEGIN DELETE FROM subscription_generation WHERE url=NEW.url AND thread=NEW.thread; INSERT INTO subscription_generation(url,thread) VALUES(NEW.url,NEW.thread); END;
+INSERT OR IGNORE INTO subscription_generation(url,thread) SELECT url,thread FROM prs;`)
 	if e != nil {
 		db.Close()
 		return nil, e
@@ -136,8 +170,8 @@ func gh(endpoint string, dst any) error {
 }
 func active(db *sql.DB, r registration) bool {
 	var t string
-	e := db.QueryRow("SELECT thread FROM prs WHERE url=?", r.URL).Scan(&t)
-	return e == nil && t == r.Thread
+	e := db.QueryRow("SELECT thread FROM prs WHERE url=? AND thread=?", r.URL, r.Thread).Scan(&t)
+	return e == nil
 }
 func already(db *sql.DB, u, k string) bool {
 	var n int
@@ -145,7 +179,9 @@ func already(db *sql.DB, u, k string) bool {
 	return n > 0
 }
 func queue(path string, r registration, msg string) error {
-	cmd := exec.Command(path, "queue", "--thread", r.Thread, "--message", msg, "--resume")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "queue", "--thread", r.Thread, "--message", msg, "--resume")
 	out, e := cmd.CombinedOutput()
 	if e != nil {
 		return fmt.Errorf("codex queue failed: %w", e)
@@ -191,27 +227,12 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 			return errors.New("closed PR is missing its closure timestamp")
 		}
 		key := "terminal:" + state + ":" + at
-		if !already(db, r.URL, key) || pendingForAnotherOwner(db, r, key) {
-			detail := fmt.Sprintf("PR %s at %s. Monitoring removed; register again if reopened.", state, at)
-			if e := saveEvents(db, r, []string{key}, []string{detail}); e != nil {
-				return e
-			}
-		}
-		var pending int
-		if e := db.QueryRow("SELECT count(*) FROM inbox_items WHERE url=? AND thread=? AND event=?", r.URL, r.Thread, key).Scan(&pending); e != nil {
+		detail := fmt.Sprintf("PR %s at %s. Monitoring removed; register again if reopened.", state, at)
+		if e := saveEvents(db, r, []string{key}, []string{detail}); e != nil {
 			return e
 		}
-		if pending != 0 {
-			sent, e := sendWake(db, path, r)
-			if e != nil {
-				return e
-			}
-			if !sent {
-				return nil
-			}
-		}
-		_, e := db.Exec("DELETE FROM prs WHERE url=? AND thread=?", r.URL, r.Thread)
-		return e
+		return wakeOwners(db, path, r.URL, key)
+
 	}
 	if p.State != "open" {
 		return fmt.Errorf("unexpected PR state %q", p.State)
@@ -251,11 +272,10 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 		return e
 	}
 	var keys, lines []string
+	statusTimes := map[string]string{}
 	add := func(k, l string) {
-		if !already(db, r.URL, k) || pendingForAnotherOwner(db, r, k) {
-			keys = append(keys, k)
-			lines = append(lines, l)
-		}
+		keys = append(keys, k)
+		lines = append(lines, l)
 	}
 	for _, page := range reviews {
 		for _, v := range page {
@@ -287,19 +307,16 @@ func scanSnapshot(db *sql.DB, r registration, path string, snapshot *gqlSnapshot
 			}
 			contexts[v.Context] = true
 			if v.State == "failure" || v.State == "error" {
-				add(fmt.Sprintf("status:%s:%d:%s", p.Head.SHA, v.ID, v.State), fmt.Sprintf("Failed current-head status %q (head %s).", v.Context, p.Head.SHA))
+				key := fmt.Sprintf("status:%s:%d:%s", p.Head.SHA, v.ID, v.State)
+				statusTimes[key] = v.UpdatedAt
+				add(key, fmt.Sprintf("Failed current-head status %q (head %s).", v.Context, p.Head.SHA))
 			}
 		}
 	}
-	if len(keys) == 0 {
-		_, e = sendWake(db, path, r)
+	if e = saveEventsWithTimes(db, r, keys, lines, statusTimes); e != nil {
 		return e
 	}
-	if e = saveEvents(db, r, keys, lines); e != nil {
-		return e
-	}
-	_, e = sendWake(db, path, r)
-	return e
+	return wakeOwners(db, path, r.URL, "")
 }
 
 func pollBatch(db *sql.DB, path string, batch []registration) bool {
@@ -360,7 +377,7 @@ func poll(db *sql.DB, path string) {
 	if !githubAvailable() {
 		return
 	}
-	rows, e := db.Query("SELECT url,thread FROM prs ORDER BY url")
+	rows, e := db.Query("SELECT url, min(thread) FROM prs GROUP BY url ORDER BY url")
 	if e != nil {
 		log.Print(e)
 		return
@@ -520,6 +537,7 @@ func run(args []string) error {
 		fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		u := fs.String("url", "", "PR URL")
 		t := fs.String("thread", "", "owning thread ID")
+		all := fs.Bool("all-threads", false, "remove all owners")
 		wake := fs.Int64("wake", -1, "wake ID from inbox")
 		through := fs.Int64("through", 0, "last handled inbox item")
 		if e = fs.Parse(args[1:]); e != nil {
@@ -534,23 +552,16 @@ func run(args []string) error {
 			return e
 		}
 		defer db.Close()
+		if *all && args[0] != "remove" {
+			return errors.New("--all-threads is only valid for remove")
+		}
 		if args[0] == "add" {
 			if strings.TrimSpace(*t) == "" {
 				return errors.New("--thread is required")
 			}
-			_, e = db.Exec("INSERT INTO prs(url,thread) VALUES(?,?) ON CONFLICT(url) DO UPDATE SET thread=excluded.thread", normalized, *t)
+			e = addOwner(db, registration{normalized, *t})
 		} else if args[0] == "remove" {
-			tx, err := db.Begin()
-			if err != nil {
-				return err
-			}
-			defer tx.Rollback()
-			for _, q := range []string{"DELETE FROM prs WHERE url=?", "DELETE FROM inbox_items WHERE url=?", "DELETE FROM inbox_wakes WHERE url=?"} {
-				if _, err = tx.Exec(q, normalized); err != nil {
-					return err
-				}
-			}
-			e = tx.Commit()
+			e = removeOwners(db, normalized, *t, *all)
 		} else if args[0] == "inbox" {
 			e = showInbox(db, normalized, *t, os.Stdout)
 		} else {

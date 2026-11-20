@@ -253,41 +253,6 @@ func TestTerminalStateNotification(t *testing.T) {
 	}
 }
 
-func TestTerminalQueuePreservesNewOwner(t *testing.T) {
-	r, d, _ := setup(t)
-	db, err := dbOpen(d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if _, err = db.Exec("INSERT INTO prs VALUES(?,?)", r.URL, r.Thread); err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(filepath.Join(d, "pull.json"), []byte(`[{"state":"closed","closed_at":"2026-01-01T10:00:00Z"}]`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	testExe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	codex := script(t, d, "switch-owner", "CODEX_MONITOR_TEST_SWITCH_OWNER=1 exec "+shellArg(testExe)+" -test.run '^TestOwnerSwitchHelper$'")
-	if err = scan(db, *r, codex); err != nil {
-		t.Fatal(err)
-	}
-	var owner string
-	if err = db.QueryRow("SELECT thread FROM prs WHERE url=?", r.URL).Scan(&owner); err != nil || owner != "new-owner" {
-		t.Fatalf("new owner lost: %q %v", owner, err)
-	}
-	replacement := registration{URL: r.URL, Thread: "new-owner"}
-	if err = scan(db, replacement, codex); err != nil {
-		t.Fatal(err)
-	}
-	var count int
-	if err = db.QueryRow("SELECT count(*) FROM inbox_items WHERE url=? AND thread=?", r.URL, replacement.Thread).Scan(&count); err != nil || count != 1 {
-		t.Fatalf("new owner missed event: %d %v", count, err)
-	}
-}
-
 func TestStartStop(t *testing.T) {
 	_, d, _ := setup(t)
 	exe := filepath.Join(d, "monitor")
